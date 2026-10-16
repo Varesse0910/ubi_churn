@@ -25,8 +25,7 @@ ubi_churn/
 │       ├── features.py       # data preparation + feature engineering
 │       ├── exploration.py    # EDA tables, data-quality checks, group comparison, plots
 │       └── ml.py             # model zoo, evaluation, SHAP, final model, ChurnPredictor
-├── tests/test_utils.py       # sanity tests (plain python recomputation, reproducibility, predictor)
-└── archive/original_notebooks/  # the notebooks before the refactor, untouched
+└── tests/test_utils.py       # sanity tests (plain python recomputation, reproducibility, predictor)
 ```
 
 ## Quick start
