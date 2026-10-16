@@ -1,0 +1,37 @@
+# Data catalog (Kedro-style): every dataset the project reads or writes.
+# Paths are relative to the project root. Load / save through `ubi_churn.config.DataCatalog`.
+#
+# Layers (Kedro data engineering convention):
+#   01_raw          untouched source files
+#   02_intermediate typed / cleaned version of the raw data
+#   04_feature      one row per player, model-ready features
+#   06_models       trained model artifacts
+#   07_model_output predictions
+#   08_reporting    figures / tables exported for reporting
+
+player_matches_raw:
+  type: polars.CSVDataset
+  filepath: data/01_raw/playersmatches_test.csv
+  load_args:
+    infer_schema: false   # the source mixes literals ('null', 'draw') into typed columns
+    null_values: ['null']
+
+player_matches:
+  type: polars.ParquetDataset
+  filepath: data/02_intermediate/player_matches.parquet
+
+player_features:
+  type: polars.ParquetDataset
+  filepath: data/04_feature/player_features.parquet
+
+churn_model:
+  type: joblib.JoblibDataset
+  filepath: data/06_models/churn_model.joblib
+
+predictions_log:
+  type: pandas.CSVDataset
+  filepath: data/07_model_output/predictions_log.csv
+
+reporting_dir:
+  type: folder
+  filepath: data/08_reporting

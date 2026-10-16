@@ -1,0 +1,13 @@
+polars>=1.30
+pandas>=2.0
+numpy>=1.24
+pyarrow>=14
+scikit-learn>=1.4
+scipy>=1.11
+matplotlib>=3.7
+seaborn>=0.13
+missingno>=0.5
+shap>=0.45
+ipywidgets>=8
+joblib>=1.3
+pyyaml>=6

@@ -1,0 +1,77 @@
+# Parameters (Kedro-style): every constant used by the notebooks and the pipeline.
+# Load with `ubi_churn.config.load_params()`. Override locally in conf/local/parameters.yml.
+
+target: still_active
+
+# --- data preparation -------------------------------------------------------
+preprocessing:
+  integer_columns: [kills, death, playernb_in_match]
+
+# --- exploration (notebooks 01-05) -----------------------------------------
+exploration:
+  victory_order: ['TRUE', 'FALSE', draw, other]
+  gamemode_order: [PVP_RANKED, PVP_UNRANKED, PVP]   # OPERATIONS (5 rows) left out of plots
+  min_matches_streak: 3        # streaks only for players with at least this many matches
+  min_decided_plot: 10         # below this, a player rate is mostly noise
+  min_matches_plot: 10         # notebook 05: rate-based plots use players with 10+ matches
+
+# --- feature engineering (notebook 04) ---------------------------------------
+features:
+  modes: [PVP_RANKED, PVP_UNRANKED, PVP]   # OPERATIONS has no feature of its own
+  session_gap_min: 30      # two matches closer than this belong to the same session
+  n_early: 5               # onboarding window (first matches)
+  n_edge: 10               # first / last N matches to measure a trend (needs 2 * n_edge matches)
+  min_decided_mode: 5      # minimum decided matches to give a per-mode win rate / K/D
+  elo:
+    start: 1000
+    k_provisional: 40
+    k_standard: 20
+    provisional_matches: 10
+  addiction:
+    min_matches: 10
+    components: [sessions_per_week, matches_per_active_day, matches_per_session, max_session_matches,
+                 active_weeks_share, share_night, stay_after_loss]
+
+# --- model selection (notebook 06) -------------------------------------------
+model_selection:
+  seed: 42
+  test_size: 0.2
+  n_folds: 5
+  n_window: 14              # days of the early window (early-warning model)
+  min_matches_segment: 10
+  silent_days: 90           # flagged active but silent for this long = suspected label noise
+  recency: [days_since_last_match, matches_last_30d, matches_last_90d]
+  # lifetime volume / duration / end-of-life state
+  lifetime: [matches, tenure_days, active_days, active_weeks, sessions, decided, wins, matches_with_kd,
+             max_gap_days, unique_teammates, unique_opponents, elo_peak, elo_low, elo_high, elo_se,
+             elo_confidence, max_win_streak, max_loss_streak, max_session_matches, kills_max,
+             current_streak, last_result_win]
+  single_feature: days_since_last_match
+  best_model: random forest
+
+# --- final model (notebooks 07-08) -------------------------------------------
+churn_model:
+  seed: 42
+  test_size: 0.2
+  cv_splits: 5
+  cv_repeats: 3
+  threshold_churn_risk: 0.5
+  threshold_grid: [0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+  random_forest:
+    n_estimators: 500
+    min_samples_leaf: 5
+  # name -> [label, unit / meaning], in the order they appear in the app
+  feature_info:
+    days_since_last_match: [Days since last match, 'days, as of today']
+    matches_last_30d: [Matches in the last 30 days, count]
+    matches_last_90d: [Matches in the last 90 days, count]
+    matches: [Matches played (lifetime), count]
+    tenure_days: [Tenure, days between first and last match]
+    sessions_per_week: [Sessions per week, a session = matches less than 30 min apart]
+    share_night: [Share of matches at night (UTC 0-6h), 0 to 1]
+    stay_after_loss: [Requeue rate after a loss, '0 to 1, share of losses followed by another match in the same session']
+    share_pvp_ranked: [Share of ranked matches, 0 to 1]
+    n_modes: [Number of game modes played, count]
+    win_rate: [Win rate, 0 to 1]
+    kd_ratio: [K/D ratio, kills / deaths]
+  note: 'Predicts P(still_active). Label is noisy (91 players flagged active are silent for 90+ days). Expect ROC-AUC about 0.8.'

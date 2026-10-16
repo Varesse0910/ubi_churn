@@ -1,0 +1,42 @@
+<script>
+(() => {
+  const motion = document.documentElement.classList.contains('motion');
+  const targets = document.querySelectorAll('.reveal, .bottom-line, .tiles, .flow, .viz, .plot, .findings, .timeline');
+
+  const easeOutExpo = t => (t === 1 ? 1 : 1 - Math.pow(2, -10 * t));
+  const countUp = el => {
+    const end = parseFloat(el.dataset.count), dec = parseInt(el.dataset.decimals || '0', 10);
+    const pre = el.dataset.prefix || '', suf = el.dataset.suffix || '';
+    const fmt = v => pre + v.toLocaleString('en-US', { minimumFractionDigits: dec, maximumFractionDigits: dec }) + suf;
+    const dur = parseInt(el.dataset.duration || '1100', 10), t0 = performance.now();
+    const tick = now => {
+      const t = Math.min(1, Math.max(0, (now - t0) / dur));
+      el.textContent = fmt(end * easeOutExpo(t));
+      if (t < 1) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  };
+
+  const activate = el => {
+    el.classList.add('in');
+    el.querySelectorAll('[data-count]').forEach((c, i) => setTimeout(() => countUp(c), 120 + i * 90));
+    if (el.classList.contains('flow')) {
+      const n = el.querySelectorAll('.step').length;
+      setTimeout(() => el.classList.add('flowing'), n * 230 + 400);   // breathe: packets start once the build is done
+    }
+    // plotly needs a resize once its container is laid out
+    if (el.classList.contains('plot') && window.Plotly) el.querySelectorAll('.js-plotly-plot').forEach(p => window.Plotly.Plots.resize(p));
+  };
+
+  if (!motion) {
+    targets.forEach(el => { el.classList.add('in'); if (el.classList.contains('flow')) el.classList.add('flowing'); });
+    return;
+  }
+  // start counters at zero only when they will animate
+  document.querySelectorAll('[data-count]').forEach(c => { c.textContent = (c.dataset.prefix || '') + '0' + (c.dataset.suffix || ''); });
+  const io = new IntersectionObserver(entries => {
+    entries.forEach(e => { if (e.isIntersecting) { activate(e.target); io.unobserve(e.target); } });
+  }, { threshold: 0.2, rootMargin: '0px 0px -8% 0px' });
+  targets.forEach(el => io.observe(el));
+})();
+</script>

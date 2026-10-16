@@ -1,0 +1,11 @@
+<!-- Plotly as a global: Quarto embeds require.js for notebook outputs, and Plotly's UMD build would
+     register as an anonymous AMD module instead of setting window.Plotly. Hide `define` while it loads. -->
+<script>window.__amdDefine = window.define; window.define = undefined;</script>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+<script>window.define = window.__amdDefine;</script>
+<script>
+  // Enable motion before first paint, unless the reader asked for reduced motion.
+  if (!window.matchMedia('(prefers-reduced-motion: reduce)').matches && 'IntersectionObserver' in window) {
+    document.documentElement.classList.add('motion');
+  }
+</script>

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ubi_churn"
+version = "0.1.0"
+description = "Player churn analysis: exploration, feature engineering and churn model"
+requires-python = ">=3.10"
+dependencies = [
+    "polars>=1.30",
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "pyarrow>=14",
+    "scikit-learn>=1.4",
+    "scipy>=1.11",
+    "matplotlib>=3.7",
+    "seaborn>=0.13",
+    "missingno>=0.5",
+    "shap>=0.45",
+    "ipywidgets>=8",
+    "joblib>=1.3",
+    "pyyaml>=6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "nbclient", "ipykernel"]
+
+[project.scripts]
+ubi-churn = "ubi_churn.pipeline:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

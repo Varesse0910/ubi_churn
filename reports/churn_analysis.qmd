@@ -1,0 +1,503 @@
+---
+title: "Churn Analysis Review"
+subtitle: "How the Ubi player churn model works, what it rests on, what the review found, and how far it can be reused"
+date: today
+date-format: "D MMMM YYYY"
+format:
+  html:
+    theme: cosmo
+    css: assets/report.css
+    include-in-header: assets/motion-head.html
+    include-after-body: assets/motion-body.html
+    embed-resources: true
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    toc-title: "On this page"
+    page-layout: article
+    grid:
+      body-width: 940px
+      sidebar-width: 230px
+    smooth-scroll: true
+    anchor-sections: false
+execute:
+  echo: false
+  warning: false
+  message: false
+jupyter: python3
+---
+
+```{python}
+#| include: false
+# ---------------------------------------------------------------------------
+# Every number on this page is recomputed here from the project catalog,
+# with the project's own code (ubi_churn.utils). Re-run build_report.py after
+# the pipeline changes and the page follows.
+# ---------------------------------------------------------------------------
+import sys
+import warnings
+from datetime import datetime, timezone
+from html import escape
+from pathlib import Path
+
+warnings.filterwarnings('ignore')
+sys.path.insert(0, str(Path.cwd().parent / 'src'))
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from IPython.display import HTML, Markdown, display
+from scipy.stats import spearmanr
+from sklearn.metrics import roc_auc_score
+
+from ubi_churn.config import DataCatalog, load_params
+from ubi_churn.utils import features as feat
+from ubi_churn.utils import ml
+
+catalog, params = DataCatalog.from_config(), load_params()
+P, MS, TARGET = params['churn_model'], params['model_selection'], params['target']
+SEED = P['seed']
+
+artifact = catalog.load('churn_model')
+predictor = ml.ChurnPredictor(artifact)
+FEATURES, T = predictor.features, predictor.threshold
+
+df_players = catalog.load('player_features')
+X = df_players.select(FEATURES).to_pandas().astype(float)
+y = df_players[TARGET].to_numpy().astype(int)
+pdf = df_players.to_pandas()
+
+df_pm = feat.prepare_player_matches(catalog.load('player_matches_raw'), params['preprocessing']['integer_columns'])
+REF_DATE = feat.reference_date(df_pm)
+N_ROWS, N_PLAYERS = df_pm.height, len(y)
+TODAY = datetime.now(timezone.utc)
+GAP_DAYS = (TODAY - REF_DATE).days
+first_match, last_match = df_pm['match_datetime'].min(), df_pm['match_datetime'].max()
+
+# --- model comparison (same candidates and protocol as notebook 07 / the train node)
+single = MS['single_feature']
+df_eval = ml.evaluate_candidates(
+    ml.make_candidate_models(FEATURES, single, SEED, P['random_forest']),
+    X, y, SEED, P['test_size'], P['cv_splits'], P['cv_repeats'],
+)
+split = df_eval['cv_roc_auc'].str.split(r' \+/- ', expand=True).astype(float)
+df_eval['cv_mean'], df_eval['cv_std'] = split[0], split[1]
+auc = df_eval.set_index('model')
+AUC_RF, AUC_RF_SD = auc.loc['random forest', 'cv_mean'], auc.loc['random forest', 'cv_std']
+AUC_ONE = auc.loc[f'1 feature ({single})', 'cv_mean']
+AUC_LR = auc.loc['logistic regression', 'cv_mean']
+GAIN = AUC_RF - AUC_ONE
+HOLD_RF = auc.loc['random forest', 'holdout_roc_auc']
+
+# --- out-of-fold vs in-sample predictions of the final random forest
+rf_pipeline = ml.make_candidate_models(FEATURES, single, SEED, P['random_forest'])['random forest'][0]
+oof = ml.out_of_fold_proba(rf_pipeline, X, y, SEED)
+ins = artifact['model'].predict_proba(X)[:, 1]
+AUC_OOF, AUC_INS = roc_auc_score(y, oof), roc_auc_score(y, ins)
+N_JUMP = int((np.abs(ins - oof) > 0.2).sum())
+risk_oof, churned = 1 - oof, 1 - y
+thr_grid = [round(t, 2) for t in np.arange(0.20, 0.86, 0.05)]
+df_thr = ml.threshold_table(churned, risk_oof, thr_grid)
+f1 = 2 * df_thr['precision'] * df_thr['recall'] / (df_thr['precision'] + df_thr['recall'])
+T_F1 = float(df_thr.loc[f1.idxmax(), 'threshold'])
+row_T = df_thr.set_index('threshold').loc[round(T, 2)]
+
+# --- reference date: features are measured at the end of the log; the form says "as of today"
+recent_active = pdf[(pdf[TARGET]) & (pdf['days_since_last_match'] < 7)]
+X_recent = recent_active[FEATURES].astype(float)
+X_today = X_recent.copy()
+X_today['days_since_last_match'] += GAP_DAYS
+X_today[['matches_last_30d', 'matches_last_90d']] = 0
+risk_then = 1 - artifact['model'].predict_proba(X_recent)[:, 1]
+risk_now = 1 - artifact['model'].predict_proba(X_today)[:, 1]
+N_RECENT, FLAG_NOW = len(X_recent), float((risk_now >= T).mean())
+
+# --- response of the model to recency, every other input at the median player
+days_grid = np.arange(0, 366, 3)
+base = pd.DataFrame([predictor.defaults] * len(days_grid))
+base['days_since_last_match'] = days_grid
+risk_curve = 1 - artifact['model'].predict_proba(base[FEATURES])[:, 1]
+RISK_DAY0 = float(risk_curve[0])
+
+# --- SHAP: mean absolute contribution per feature (percentage points of churn risk)
+expl = predictor.explain(X)
+shap_imp = pd.Series(np.abs(expl.values).mean(axis=0) * 100, index=predictor.labels).sort_values(ascending=False)
+
+# --- label evidence
+silent_active = int((pdf[TARGET] & (pdf['days_since_last_match'] >= MS['silent_days'])).sum())
+recent_inactive = int((~pdf[TARGET] & (pdf['matches_last_30d'] > 0)).sum())
+days = pdf['days_since_last_match'].to_numpy()
+best_rule = max(((days < t) == pdf[TARGET].to_numpy()).mean() for t in np.unique(np.round(days)))
+rho = {c: round(float(spearmanr(pdf[c], pdf[TARGET], nan_policy='omit')[0]), 2) + 0.0 for c in ['kd_ratio', 'win_rate', 'elo']}
+ACTIVE_SHARE = y.mean()
+
+# --- prediction log
+log = catalog.load('predictions_log') if catalog.exists('predictions_log') else pd.DataFrame()
+if len(log):
+    expected = np.where(log['churn_risk'] >= T, ml.AT_RISK_LABEL, ml.ACTIVE_LABEL)
+    LOG_N, LOG_BAD = len(log), int((expected != log['prediction']).sum())
+    LOG_RANGE = int(sum(bool(predictor.check_inputs(r)) for r in log[FEATURES].to_dict('records')))
+else:
+    LOG_N = LOG_BAD = LOG_RANGE = 0
+
+N_TESTS = sum(line.lstrip().startswith('def test') for line in (Path.cwd().parent / 'tests' / 'test_utils.py').read_text(encoding='utf-8').splitlines())
+
+
+# ---------------------------------------------------------------------------
+# Small HTML builders (charts follow the dataviz mark specs: thin bars, 4px data-end radius,
+# hover tooltip, a table view, text in ink colours, never in the series colour)
+# ---------------------------------------------------------------------------
+def pct(v: float, lo: float, hi: float) -> float:
+    return 100 * (v - lo) / (hi - lo)
+
+
+def bar_chart(title: str, sub: str, rows: list[dict], lo: float = 0.0, hi: float = 1.0, ticks: list[float] | None = None,
+              fmt: str = '{:.3f}', ref: tuple[float, str] | None = None, table_head: tuple[str, str] = ('', 'value')) -> str:
+    ticks = ticks if ticks is not None else [lo + (hi - lo) * k / 4 for k in range(5)]
+    out = [f'<div class="viz"><div class="viz-title">{escape(title)}</div><div class="viz-sub">{sub}</div><div class="bars">']
+    for i, r in enumerate(rows):
+        w = pct(r['value'], lo, hi)
+        colour = r.get('colour', 'var(--s1)')
+        whisker, val_cls = '', 'val'
+        if r.get('ci'):
+            a, b = r['ci']
+            whisker = f'<div class="whisker" style="--lo:{pct(a, lo, hi):.2f}%;--span:{pct(b, lo, hi) - pct(a, lo, hi):.2f}%"></div>'
+            val_cls = 'val after-whisker'
+            span_style = f'--lo:{pct(a, lo, hi):.2f}%;--span:{pct(b, lo, hi) - pct(a, lo, hi):.2f}%;'
+        else:
+            span_style = ''
+        refl = f'<div class="refline" style="--x:{pct(ref[0], lo, hi):.2f}%"></div>' if ref else ''
+        out.append(
+            f'<div class="bl">{r["label"]}</div>'
+            f'<div class="track" tabindex="0" style="--w:{w:.2f}%;{span_style}--i:{i};--c:{colour}">'
+            f'{refl}<div class="fill"></div>{whisker}<div class="{val_cls}">{fmt.format(r["value"])}</div>'
+            f'<div class="tip">{r.get("tip", "")}</div><div class="hit"></div></div>'
+        )
+    out.append('</div><div class="axis-row"><div></div><div class="axis">')
+    out += [f'<span style="left:{pct(t, lo, hi):.2f}%">{t:g}</span>' for t in ticks]
+    out.append('</div></div>')
+    out.append(f'<details><summary>Show as table</summary><table class="table table-sm"><thead><tr><th>{table_head[0]}</th><th>{table_head[1]}</th></tr></thead><tbody>')
+    out += [f'<tr><td>{r["label"]}</td><td>{fmt.format(r["value"])}{" (" + fmt.format(r["ci"][0]) + " to " + fmt.format(r["ci"][1]) + ")" if r.get("ci") else ""}</td></tr>' for r in rows]
+    out.append('</tbody></table></details></div>')
+    return ''.join(out)
+
+
+def plot_html(fig: go.Figure, title: str, sub: str) -> str:
+    fig.update_layout(
+        height=360, margin=dict(l=56, r=24, t=16, b=48),
+        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='#fcfcfb',
+        font=dict(family='system-ui, -apple-system, Segoe UI, sans-serif', color='#52514e', size=13),
+        hoverlabel=dict(bgcolor='#ffffff', bordercolor='rgba(11,11,11,0.15)', font=dict(color='#0b0b0b')),
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, x=0, font=dict(color='#0b0b0b')),
+    )
+    fig.update_xaxes(gridcolor='#e1e0d9', linecolor='#c3c2b7', zeroline=False, tickfont=dict(color='#898781'))
+    fig.update_yaxes(gridcolor='#e1e0d9', linecolor='#c3c2b7', zeroline=False, tickfont=dict(color='#898781'))
+    body = fig.to_html(full_html=False, include_plotlyjs=False,
+                       config={'displayModeBar': False, 'responsive': True})
+    return f'<div class="plot"><div class="viz-title">{escape(title)}</div><div class="viz-sub">{sub}</div><div class="plot-body">{body}</div></div>'
+
+
+def badge(kind: str, text: str) -> str:
+    return f'<span class="badge {kind}"><span class="dot"></span>{escape(text)}</span>'
+
+
+def md(text: str) -> None:
+    display(Markdown(text))
+
+
+def html(text: str) -> None:
+    display(HTML(text))
+```
+
+## Bottom line
+
+```{python}
+html(f'''
+<div class="bottom-line">
+  <div class="kicker">Bottom line</div>
+  <div class="verdict">The model ranks players reasonably well, but most of what it knows is
+  "how long since this player last played", and the predictor currently reads that clock wrong.</div>
+  <ul>
+    <li><b>It works as a ranking tool.</b> Cross-validated ROC-AUC {AUC_RF:.2f} (± {AUC_RF_SD:.2f}) on {N_PLAYERS} players; the method is clean (no leakage between folds, honest baselines).</li>
+    <li><b>It is mostly a recency rule.</b> <i>Days since last match</i> alone scores {AUC_ONE:.2f}; the other 11 inputs add <b>+{GAIN:.2f}</b>, about the size of the fold-to-fold noise.</li>
+    <li><b>Do not use it on live players yet.</b> Inputs must be measured at the end of the log ({REF_DATE:%d %b %Y}), not "as of today": that shift alone flags {FLAG_NOW:.0%} of recently active players as churners.</li>
+    <li><b>The label is an assumption.</b> <code>still_active</code> is treated as a snapshot taken after the log ends; this is not confirmed, and {silent_active} "active" players have been silent for {MS["silent_days"]}+ days.</li>
+    <li><b>Next step:</b> build a forward-looking churn label from the log itself (features before a cutoff, label after it) and validate over time.</li>
+  </ul>
+</div>
+<div class="tiles">
+  <div class="tile" style="--i:0;--tile-accent:var(--s1)"><div class="v"><span data-count="{AUC_RF:.3f}" data-decimals="2">{AUC_RF:.2f}</span></div><div class="l">CV ROC-AUC, random forest (12 inputs)</div></div>
+  <div class="tile" style="--i:1;--tile-accent:var(--s2)"><div class="v"><span data-count="{GAIN:.3f}" data-decimals="2" data-prefix="+">+{GAIN:.2f}</span></div><div class="l">gain over recency alone ({AUC_ONE:.2f})</div></div>
+  <div class="tile" style="--i:2;--tile-accent:var(--critical)"><div class="v"><span data-count="{GAP_DAYS}" data-suffix=" d">{GAP_DAYS} d</span></div><div class="l">between the end of the log and today</div></div>
+  <div class="tile" style="--i:3"><div class="v"><span data-count="{N_PLAYERS}">{N_PLAYERS}</span></div><div class="l">players ({ACTIVE_SHARE:.0%} still active)</div></div>
+  <div class="tile" style="--i:4"><div class="v"><span data-count="{N_ROWS}">{N_ROWS:,}</span></div><div class="l">player-match rows in the log</div></div>
+</div>''')
+```
+
+## How the analysis works
+
+The project turns a raw player-match log into one row per player, compares models on those rows, saves the best one and serves it through a small predictor. Each box below is a notebook in `notebooks/` and, for the steps that produce data, a node of `python -m ubi_churn.pipeline`.
+
+```{python}
+steps = [
+    ('01 – 03', 'Raw match log', f'{N_ROWS:,} rows, {first_match:%b %Y} to {last_match:%d %b %Y}. Scope, data quality, win rate, K/D, streaks.', False),
+    ('04', 'Player features', f'{N_PLAYERS} players × {df_players.width - 2} features: activity, recency, performance, Elo, behaviour, modes, social.', False),
+    ('05', 'Active vs inactive', 'Which features differ between the two groups of the label.', False),
+    ('06', 'Model selection', 'Feature sets × models, holdout + CV + cohort split, segments, label-noise check, SHAP.', False),
+    ('07', 'Final model', f'Random forest on 12 inputs a person can type, threshold {T:.2f}, metrics from CV and holdout.', True),
+    ('08', 'Predictor', 'Form, batch scoring, SHAP explanation per player, prediction log.', False),
+]
+parts = []
+for i, (nb, name, what, key) in enumerate(steps):
+    if i:
+        parts.append(f'<div class="wire" style="--i:{i}"><span class="packet" style="--i:{i}"></span></div>')
+    parts.append(f'<div class="step{" key" if key else ""}" style="--i:{i}"><div class="nb">Notebook {nb}</div><div class="name">{name}</div><div class="what">{what}</div></div>')
+html('<div class="flow">' + ''.join(parts) + '</div>')
+```
+
+**The question.** Will a player still be active at the flag date (`still_active`, a TRUE/FALSE column delivered with the log)? The model returns *P(still active)*; the churn risk is one minus that, and a player is flagged *at risk* when the churn risk reaches the threshold.
+
+**The logic, step by step.**
+
+1. **Describe and clean** (01–03). Check scope, nulls, duplicates and lobby consistency; compute per-player performance.
+2. **Aggregate per player** (04). Every time-based feature (days since last match, matches in the last 30 / 90 days, recent windows) is measured **back from the last date in the log**, not from the date the model is used.
+3. **Compare** (05–06). Several feature sets (behaviour only; full history + recency; + recent windows; an early-warning set for new players) × models (baseline, single feature, logistic regression, random forest, gradient boosting). Preprocessing sits inside the sklearn pipelines, so it is refitted on each training fold.
+4. **Choose and save** (07). Twelve inputs score the same as 68, so the saved model is a random forest on twelve fields a person can read from a player profile. The final fit uses all players; its quality numbers come from cross-validation and a holdout, not from that final fit.
+5. **Serve** (08). A form, a batch scorer, a SHAP waterfall per prediction, and a CSV log of every prediction.
+
+## Hypotheses tested
+
+The analysis rests on six hypotheses. Only one is firmly supported by the data; the most important one, what the label means, is still an assumption.
+
+```{python}
+best_rule_txt = f'{best_rule:.0%}'
+cards = [
+    ('warning', 'Unconfirmed', 'H1. <code>still_active</code> is a snapshot taken after the log ends',
+     f'<b>For:</b> the flag follows recency without being a rule (the best single cut-off on days since last match agrees with it for {best_rule_txt} of players); {recent_inactive} players flagged inactive played in the last 30 days, which fits "left after the log ended".',
+     f'<b>Against:</b> {silent_active} players flagged active have not played for {MS["silent_days"]}+ days. Needs the data owner\'s definition.'),
+    ('serious', 'Depends on H1', 'H2. Recency features are fair predictors, not leakage',
+     '<b>True only if H1 holds.</b> Notebook 04 calls the same features "leaking the target, to keep out of any churn model"; notebooks 06–08 use them as the three main inputs.',
+     'The two notes contradict each other, and the predictor does not mention the assumption.'),
+    ('neutral', 'Weak', 'H3. How a player plays predicts churn beyond recency',
+     f'<b>Small gain:</b> the full model adds +{GAIN:.2f} ROC-AUC over recency alone.',
+     f'<b>Skill barely matters:</b> Spearman with the label is {rho["kd_ratio"]:.2f} for K/D, {rho["win_rate"]:.2f} for win rate, {rho["elo"]:.2f} for Elo. Engagement (volume, tenure, modes) carries what signal there is.'),
+    ('good', 'Supported', 'H4. Twelve readable inputs are enough',
+     '<b>Same score as the 68-feature model</b> in notebook 06 (0.83 vs 0.82 CV ROC-AUC, inside the fold noise); the recent-window features added nothing.',
+     'Caveat: the twelve were chosen on the same data, so the scores are slightly optimistic.'),
+    ('neutral', 'Plausible, untested', f'H5. The {silent_active} silent "active" players are label noise',
+     'Treated as noise and <b>kept in training</b>; they likely explain why risk dips again for very long absences (see Results).',
+     'Not tested: retraining without them, or asking how the flag is computed.'),
+    ('neutral', 'Untested', 'H6. The predicted probability can be read as a probability',
+     f'The form displays "P(still active) = 66.8%" and the decision uses a fixed {T:.2f} threshold, which assumes a calibrated model.',
+     'No calibration curve or Brier score was computed.'),
+]
+html('<div class="cards">' + ''.join(
+    f'<div class="card reveal" data-dir="scale" style="--i:{i}">{badge(k, s)}<h4>{h}</h4><p>{a}</p><p>{b}</p></div>'
+    for i, (k, s, h, a, b) in enumerate(cards)) + '</div>')
+```
+
+## Results
+
+### Model quality: the forest beats recency alone, by a little
+
+```{python}
+order = ['dummy (prior)', f'1 feature ({single})', 'logistic regression', 'random forest']
+names = {'dummy (prior)': 'Baseline (always the prior)', f'1 feature ({single})': 'Days since last match only',
+         'logistic regression': 'Logistic regression, 12 inputs', 'random forest': 'Random forest, 12 inputs (saved)'}
+rows = []
+for m in order:
+    r = auc.loc[m]
+    rows.append(dict(label=names[m], value=r['cv_mean'], ci=(r['cv_mean'] - r['cv_std'], r['cv_mean'] + r['cv_std']),
+                     colour='var(--s1)' if m == 'random forest' else 'var(--axis)',
+                     tip=f'<b>{names[m]}</b><br>CV ROC-AUC {r["cv_mean"]:.3f} ± {r["cv_std"]:.3f}<br>holdout ROC-AUC {r["holdout_roc_auc"]:.3f}<br>CV PR-AUC {r["cv_pr_auc"]}'))
+html(bar_chart('Cross-validated ROC-AUC (mean ± 1 std over 15 folds)',
+               f'Repeated stratified 5-fold CV on 80% of the players; dashed line = a coin flip (0.5). Holdout ROC-AUC of the saved model: {HOLD_RF:.3f}.',
+               rows, ref=(0.5, 'random'), table_head=('model', 'CV ROC-AUC (± 1 std)')))
+md(f'The whisker of the single-feature model overlaps the forest\'s: with {N_PLAYERS} players, the gain of +{GAIN:.2f} cannot be told apart from noise with confidence. The forest is still the right pick (best or tied in every comparison, stable, no scaling), but the honest description is **"a recency rule, slightly refined"**.')
+```
+
+### What drives a prediction
+
+```{python}
+top = shap_imp.head(8)
+rows = [dict(label=k, value=v, colour='var(--s1)', tip=f'<b>{k}</b><br>moves the churn risk by {v:.1f} points on average') for k, v in top.items()]
+hi = float(np.ceil(top.max() / 5) * 5)
+html(bar_chart('Mean absolute SHAP impact on churn risk (percentage points)',
+               f'Average size of each input\'s push on a player\'s churn risk, over the {N_PLAYERS} training players. Top 8 of 12.',
+               rows, lo=0, hi=hi, ticks=[hi * k / 4 for k in range(5)], fmt='{:.1f}', table_head=('input', 'mean |SHAP| (points)')))
+md('Recency, tenure and volume dominate; skill (win rate, K/D) does not make the top 8. Because recency, recent counts, lifetime matches and tenure are strongly correlated, SHAP splits the credit between them somewhat arbitrarily: read this as *what the model uses*, not *why players leave*.')
+```
+
+### How the model reacts to recency
+
+```{python}
+fig = go.Figure()
+fig.add_trace(go.Scatter(x=days_grid, y=risk_curve, mode='lines', line=dict(color='#2a78d6', width=2),
+                         name='churn risk', hovertemplate='%{x} days since last match<br>churn risk %{y:.2f}<extra></extra>'))
+fig.add_hline(y=T, line=dict(color='#898781', dash='dash', width=1.5))
+fig.add_annotation(x=days_grid[-1], y=T, text=f'threshold {T:.2f}', showarrow=False, xanchor='right', yanchor='bottom', font=dict(color='#52514e'))
+fig.update_layout(hovermode='x', showlegend=False)
+fig.update_xaxes(title='days since last match', range=[0, 365])
+fig.update_yaxes(title='churn risk', range=[0, 1], tickformat='.1f')
+html(plot_html(fig, 'Churn risk vs days since last match, every other input at the median player',
+               'Hover the line to read values. The median player has 0 matches in the last 30 and 90 days, which is why risk starts above the threshold even at day 0.'))
+md(f'Risk climbs steeply in the first month, flattens, and **dips again past ~250 days**, most likely the {silent_active} silent "active" players at work. Note the day-0 value of {RISK_DAY0:.2f}: a player who "played today" but has 0 matches in the last 30 days is an impossible profile, and the form allows it (finding 3).')
+```
+
+### Choosing the threshold
+
+```{python}
+fig = go.Figure()
+for col, colour, label in [('precision', '#2a78d6', 'precision'), ('recall', '#eb6834', 'recall')]:
+    fig.add_trace(go.Scatter(x=df_thr['threshold'], y=df_thr[col], mode='lines+markers', name=label,
+                             line=dict(color=colour, width=2), marker=dict(size=8, line=dict(color='#fcfcfb', width=2)),
+                             hovertemplate=f'{label} %{{y:.3f}}<extra></extra>'))
+    fig.add_annotation(x=df_thr['threshold'].iloc[-1], y=df_thr[col].iloc[-1], text=label, showarrow=False, xanchor='left', xshift=8, font=dict(color='#0b0b0b'))
+fig.add_trace(go.Scatter(x=df_thr['threshold'], y=df_thr['players flagged'] / N_PLAYERS, mode='lines', name='share of players flagged',
+                         line=dict(color='#898781', width=1.5, dash='dot'), hovertemplate='flagged %{y:.0%}<extra></extra>'))
+fig.add_vline(x=T, line=dict(color='#0b0b0b', width=1, dash='dash'))
+fig.add_annotation(x=T, y=0.04, text=f'saved threshold {T:.2f}', showarrow=False, xanchor='left', xshift=6, font=dict(color='#52514e'))
+fig.update_layout(hovermode='x unified', margin=dict(r=80))
+fig.update_xaxes(title='churn-risk threshold', range=[0.18, 0.9])
+fig.update_yaxes(title='', range=[0, 1.02], tickformat='.0%')
+html(plot_html(fig, 'Precision and recall of the churn class by threshold (out-of-fold)',
+               f'Every player scored by a model that did not see them. Churners are the majority ({1 - ACTIVE_SHARE:.0%}), so maximising F1 would pick {T_F1:.2f} and flag almost everyone.'))
+md(f'At the saved threshold of **{T:.2f}**, the model flags {int(row_T["players flagged"])} of {N_PLAYERS} players ({row_T["players flagged"] / N_PLAYERS:.0%}); {row_T["precision"]:.0%} of them are real churners and it catches {row_T["recall"]:.0%} of all churners. The right value depends on what a retention action costs: lower catches more churners, higher raises fewer false alarms.')
+```
+
+## Findings from the review
+
+Notebook 08 runs end to end without error, and its SHAP explanations are exact (base value plus contributions equals each churn risk). The problems below do not show in its own outputs; each was reproduced with the project's data.
+
+```{python}
+findings = [
+    ('critical', 'Critical', 'The form asks for recency "as of today"; the model learned it as of the log end',
+     f'Features are measured back from {REF_DATE:%d %b %Y}; <code>parameters.yml</code> labels the input "days, as of today". Today is {GAP_DAYS} days later. Re-measuring the {N_RECENT} active players who played in the last week of the log, as of today and without new matches, moves their mean churn risk from <b>{risk_then.mean():.2f} to {risk_now.mean():.2f}</b> and flags <b>{FLAG_NOW:.0%}</b> of them.',
+     'Fix: make the reference date a parameter, show it in the form, and compute every input at that date.'),
+    ('serious', 'Serious', 'The prediction log does not record the threshold or model version',
+     f'{LOG_BAD} of {LOG_N} logged rows carry a label that the current threshold would not give (a churn risk of 0.33 saved as "At risk", written while the threshold was still the F1-optimal value). The log page then counts at-risk players with the current threshold, so its total and the <code>prediction</code> column disagree.',
+     'Fix: store threshold, model date and a model hash in every log row.'),
+    ('serious', 'Serious', 'Impossible inputs are accepted',
+     f'{LOG_RANGE} logged row(s) fall outside the training range (e.g. −6 matches in the last 90 days). The refactor\'s <code>check_inputs</code> now warns on ranges, but not on contradictions: 200 days since the last match with 40 matches in the last 30 days still gets a score. The training data never breaks these rules (30-day ≤ 90-day ≤ lifetime count; no recent match if the last one is older).',
+     'Fix: add cross-field rules and block, not only warn.'),
+    ('serious', 'Serious', 'Batch scoring with <code>STORE = True</code> can corrupt the log',
+     '<code>append_predictions</code> appends rows in the input file\'s column order without aligning to the existing header. A file missing some model columns shifts values under the wrong headers (reproduced: a prediction label ends up under <code>tenure_days</code>).',
+     'Fix: reindex to the log\'s columns before appending.'),
+    ('warning', 'Warning', 'Scoring the training file looks much better than reality',
+     f'The batch tool suggests <code>player_features.parquet</code> as an example, but the saved model was fitted on those players: ROC-AUC <b>{AUC_INS:.3f}</b> in-sample vs <b>{AUC_OOF:.3f}</b> out-of-fold, and {N_JUMP} players\' scores move by more than 0.2.',
+     'Fix: warn when scoring training players, or ship out-of-fold scores for them.'),
+    ('warning', 'Warning', 'The notebooks contradict each other on recency',
+     'Notebook 04 says recency "leaks the target, to keep out of any churn model"; 06–08 use it as the main input under an unconfirmed assumption that 08 never states.',
+     'Fix: state the assumption in 04 and 08 with a pointer to 06.'),
+    ('neutral', 'Minor', 'Small inconsistencies',
+     'Risk dips again past ~250 days of absence; the markdown says "above the threshold" while the code uses <code>&gt;=</code>; the sanity check only tries two obvious players.',
+     'Fix: add edge-case examples to the tests.'),
+]
+html('<div class="findings">' + ''.join(
+    f'<div class="finding" style="--i:{i}"><div class="sev">{badge(k, s)}</div><div><h4>{h}</h4><p>{a}</p><p class="fix">{b}</p></div></div>'
+    for i, (k, s, h, a, b) in enumerate(findings)) + '</div>')
+```
+
+### Evidence for the two numbers that matter most
+
+```{python}
+html('<div class="cols">' + bar_chart(
+    'Mean churn risk of players active in the last week of the log',
+    f'{N_RECENT} players. Same players, same matches; only the date their inputs are measured at changes. Dashed line = threshold {T:.2f}.',
+    [dict(label=f'measured at log end<br><span class="small">{REF_DATE:%d %b %Y}</span>', value=float(risk_then.mean()), colour='var(--s1)',
+          tip=f'mean risk {risk_then.mean():.3f}<br>flagged {(risk_then >= T).mean():.0%}'),
+     dict(label=f'measured today<br><span class="small">+{GAP_DAYS} days</span>', value=float(risk_now.mean()), colour='var(--critical)',
+          tip=f'mean risk {risk_now.mean():.3f}<br>flagged {FLAG_NOW:.0%}')],
+    ref=(T, f'threshold {T:.2f}'), fmt='{:.2f}', table_head=('measured at', 'mean churn risk')) + bar_chart(
+    'ROC-AUC of the saved model on its own training players',
+    'In-sample is what batch-scoring player_features.parquet shows; out-of-fold is what to expect on new players. Dashed line = a coin flip.',
+    [dict(label='in-sample', value=AUC_INS, colour='var(--axis)', tip=f'ROC-AUC {AUC_INS:.3f}: the model has seen these players'),
+     dict(label='out-of-fold', value=AUC_OOF, colour='var(--s1)', tip=f'ROC-AUC {AUC_OOF:.3f}: each player scored by a model that did not see them')],
+    ref=(0.5, 'random'), table_head=('scoring', 'ROC-AUC')) + '</div>')
+```
+
+## Is the technical approach sound?
+
+```{python}
+html(f'''<div class="cols">
+<div class="col reveal" data-dir="left"><h4>{badge("good", "Sound")} What is done well</h4><ul>
+<li><b>No leakage between folds:</b> imputation and scaling sit inside the sklearn pipelines.</li>
+<li><b>Honest comparisons:</b> a dummy baseline and a single-feature model, ROC-AUC and PR-AUC, holdout plus repeated CV, and a cohort split in 06.</li>
+<li><b>Reasoned choices:</b> random forest with no scaling, 12 inputs with the evidence shown, threshold choice argued instead of taken from F1.</li>
+<li><b>Limits stated:</b> label noise, "rank players, not a certainty".</li>
+<li><b>SHAP used correctly:</b> contributions add up exactly to each prediction.</li>
+</ul></div>
+<div class="col reveal" data-dir="right" style="--i:1"><h4>{badge("serious", "Weak")} Where it falls short</h4><ul>
+<li><b>Framing:</b> the label is a snapshot from an unknown rule, so the model learns "has this player gone quiet", not "will this player leave".</li>
+<li><b>Validation is random, not over time:</b> the model is meant to be used later than it was trained, and nothing tests that.</li>
+<li><b>Small sample:</b> a holdout of {int(N_PLAYERS * P["test_size"])} players gives roughly ±0.03 on ROC-AUC; 0.81 vs 0.82 cannot separate models.</li>
+<li><b>No calibration check</b> although the page displays probabilities.</li>
+<li><b>Correlated inputs:</b> SHAP credit between recency, volume and tenure is partly arbitrary.</li>
+</ul></div></div>''')
+md('**Verdict:** good enough for an exploratory study and a ranking demo. For real churn prediction, fix the framing (the label) before tuning anything else.')
+```
+
+## Reusability
+
+The refactor into `ubi_churn/` makes most of the work reusable: configuration in `conf/`, data by layer in `data/`, code in `src/`, the notebooks reading through the same catalog.
+
+```{python}
+html(f'''<div class="cols">
+<div class="col reveal" data-dir="fade"><h4>{badge("good", "Reuse as is")}</h4><ul>
+<li><b>Pipeline:</b> <code>python -m ubi_churn.pipeline</code> rebuilds typed matches → features → model from the raw CSV; <code>--nodes</code> runs a subset.</li>
+<li><b>Feature engineering</b> (<code>utils/features.py</code>): any match log with the same columns; session gap, Elo and windows are parameters.</li>
+<li><b>Evaluation</b> (<code>utils/ml.py</code>): candidate models, repeated CV + holdout, out-of-fold scores, threshold table, SHAP. This page calls them directly.</li>
+<li><b>Configuration:</b> every constant in <code>conf/base/parameters.yml</code>, overridable in <code>conf/local/</code>.</li>
+<li><b>Predictor:</b> <code>ChurnPredictor</code> wraps the saved artifact (predict, range check, explain); {N_TESTS} sanity tests in <code>tests/</code>.</li>
+</ul></div>
+<div class="col reveal" data-dir="fade" style="--i:1"><h4>{badge("warning", "Fix before reuse")}</h4><ul>
+<li><b>Reference date:</b> today it is the last match of the file; make it a parameter so new data or live scoring use a known date.</li>
+<li><b>Input label:</b> change "days, as of today" in <code>parameters.yml</code> to "days before the reference date".</li>
+<li><b>Prediction log:</b> add threshold and model version per row; align columns on append.</li>
+<li><b>Validation:</b> cross-field input rules in <code>ChurnPredictor.check_inputs</code>.</li>
+<li><b>Label:</b> the model is tied to this file's <code>still_active</code> rule; another dataset with another flag needs a new label definition, not only a re-run.</li>
+</ul></div></div>''')
+```
+
+| You want to… | Do |
+|---|---|
+| Rebuild everything from a new raw CSV | put it at `data/01_raw/playersmatches_test.csv`, run `python -m ubi_churn.pipeline` |
+| Change a constant (session gap, threshold, inputs) | edit `conf/base/parameters.yml` or override it in `conf/local/parameters.yml`, re-run the pipeline |
+| Score players | `ChurnPredictor(catalog.load('churn_model')).predict(df)` or notebook 08 |
+| Refresh this report | `python reports/build_report.py` (writes `data/08_reporting/churn_analysis.html`) |
+
+## What to do next
+
+The single change with the most value is a churn label built from the log itself. It answers the real question, removes the dependency on the unexplained flag, and makes the reference date explicit by construction.
+
+```{python}
+total = (last_match - first_match).days
+cut_days = 60
+x0, x1 = 40, 760
+cut_x = x0 + (x1 - x0) * (total - cut_days) / total
+html(f'''<div class="viz timeline"><div class="viz-title">A forward-looking churn label</div>
+<div class="viz-sub">Pick a cutoff inside the log. Inputs use only matches before it; the label is whether the player plays again after it. Repeat at several cutoffs to validate over time.</div>
+<svg class="timeline-svg" viewBox="0 0 800 180" role="img" aria-label="Timeline: inputs before the cutoff, label window after it">
+  <line x1="{x0}" y1="92" x2="{x1}" y2="92" stroke="#c3c2b7" stroke-width="2"/>
+  <text x="{x0}" y="122" font-size="16" fill="#898781">{first_match:%b %Y}</text>
+  <text x="{x1}" y="122" font-size="16" fill="#898781" text-anchor="end">{last_match:%d %b %Y}</text>
+  <g class="win"><rect x="{x0}" y="72" width="{cut_x - x0 - 3:.1f}" height="14" rx="4" fill="#2a78d6"/>
+    <text x="{x0}" y="60" font-size="18" fill="#0b0b0b" font-weight="650">inputs: every match before the cutoff</text></g>
+  <g class="win label"><rect x="{cut_x + 3:.1f}" y="72" width="{x1 - cut_x - 3:.1f}" height="14" rx="4" fill="#eb6834"/>
+    <text x="{x1}" y="60" font-size="18" fill="#0b0b0b" text-anchor="end" font-weight="650">label: plays again?</text></g>
+  <g class="cutoff"><line x1="{cut_x:.1f}" y1="66" x2="{cut_x:.1f}" y2="140" stroke="#0b0b0b" stroke-width="1.5" stroke-dasharray="5 4"/>
+    <text x="{cut_x:.1f}" y="162" font-size="16" fill="#0b0b0b" text-anchor="middle">cutoff = log end − {cut_days} days</text></g>
+</svg></div>''')
+```
+
+1. **Confirm the flag** with the data owner: how `still_active` is computed, and at which date. This settles H1 and H2.
+2. **Build the forward-looking label** above, with the cutoff and the label window as parameters; validate on a later cutoff than the one used for training.
+3. **Fix the predictor**: reference date in the form, cross-field checks, versioned and aligned log (findings 1–4).
+4. **Check calibration** (reliability curve, Brier score) before showing probabilities, and set the threshold from the cost of a retention action.
+5. **Then** revisit features: with a forward label, behaviour features may carry more signal than they do today.
+
+---
+
+::: {.small}
+Generated by `reports/build_report.py` from `reports/churn_analysis.qmd`. All figures are recomputed from the project catalog with `ubi_churn.utils`; the seed comes from `parameters.yml`, so the numbers are reproducible. Respects *reduced motion*: with that setting on, every element appears without animation.
+:::

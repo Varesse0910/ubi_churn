@@ -1,0 +1,5 @@
+timestamp,player_id,days_since_last_match,matches_last_30d,matches_last_90d,matches,tenure_days,sessions_per_week,share_night,stay_after_loss,share_pvp_ranked,n_modes,win_rate,kd_ratio,p_active,churn_risk,prediction
+2026-10-16T15:24:44,player_152444,99.808,0.0,-6.0,27.5,55.771,1.653,0.168,0.5,0.0,2.0,0.489,0.863,0.244,0.756,At risk (likely churn)
+2026-10-16T15:25:35,player_152535,10.0,6.0,20.0,27.5,55.771,1.653,0.168,0.5,0.0,2.0,0.489,0.863,0.668,0.332,At risk (likely churn)
+2026-10-16T15:25:52,player_152552,99.808,0.0,0.0,27.5,55.771,1.653,0.168,0.5,0.0,2.0,0.489,0.863,0.244,0.756,At risk (likely churn)
+2026-10-16T15:31:38,player_153137,99.808,0.0,0.0,27.5,55.771,1.653,0.168,0.5,0.0,2.0,0.489,0.863,0.244,0.756,At risk (likely churn)
