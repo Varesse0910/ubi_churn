@@ -16,8 +16,9 @@ ubi_churn/
 │   ├── 04_feature/           # player_features.parquet (one row per player, 72 columns)
 │   ├── 06_models/            # churn_model.joblib (model + features + threshold + metrics)
 │   ├── 07_model_output/      # predictions_log.csv, *_scored.csv
-│   └── 08_reporting/
+│   └── 08_reporting/         # churn_analysis.html (the review report)
 ├── notebooks/                # 01 -> 08, the analysis (read the markdown observations)
+├── reports/                  # churn_analysis.qmd (report source) + build_report.py
 ├── src/ubi_churn/
 │   ├── config.py             # PROJECT_ROOT, load_params(), DataCatalog
 │   ├── pipeline.py           # nodes: prepare -> features -> train
@@ -25,7 +26,8 @@ ubi_churn/
 │       ├── features.py       # data preparation + feature engineering
 │       ├── exploration.py    # EDA tables, data-quality checks, group comparison, plots
 │       └── ml.py             # model zoo, evaluation, SHAP, final model, ChurnPredictor
-└── tests/test_utils.py       # sanity tests (plain python recomputation, reproducibility, predictor)
+├── tests/test_utils.py       # sanity tests (plain python recomputation, reproducibility, predictor)
+└── CLAUDE.md                 # project guide for Claude Code (ask questions about the code)
 ```
 
 ## Quick start
@@ -71,3 +73,47 @@ df = catalog.load('player_matches')
 
 To change a constant (session gap, Elo K factor, churn threshold, model features...), edit
 `conf/base/parameters.yml` (or override it in `conf/local/parameters.yml`), then re-run the pipeline.
+
+## Reading the HTML report
+
+`data/08_reporting/churn_analysis.html` is the review of the whole analysis: bottom line, how it works,
+hypotheses tested, results, findings, reusability and next steps.
+
+**Open it**
+- From your computer: double-click the file (or right-click > Open with > your browser). It is a single
+  self-contained file, so it works offline and you can send it by email as is.
+- From GitHub: GitHub shows the HTML source, not the page. Open the file in the repo, click
+  **Download raw file**, then open the downloaded file in your browser (or clone the repo).
+
+**Find your way**
+- Start with **Bottom line** at the top: the verdict and the key numbers in five bullets.
+- Use the **On this page** menu on the left to jump to a section.
+- Charts are interactive: hover a bar or a point to see its exact value.
+- **What to do next** at the end lists the actions.
+
+**Rebuild it** (after the data or the model changes). It needs [Quarto](https://quarto.org) and `plotly`:
+
+```bash
+python reports/build_report.py                          # quarto on PATH
+python reports/build_report.py --quarto C:/path/to/quarto.exe
+```
+
+Every number in the report is recomputed from the catalog with the project code, so a rebuild follows the
+latest pipeline run.
+
+## Ask questions about the code (Claude Code)
+
+`CLAUDE.md` at the root describes the project for [Claude Code](https://claude.com/claude-code): what the
+data is, where each piece of logic lives, the commands, and the caveats that matter (recency, label
+assumption, data quirks). Claude Code reads it automatically, so you can ask questions straight away.
+
+1. Install Claude Code (`npm install -g @anthropic-ai/claude-code`) or use the VS Code extension.
+2. Open a terminal in the project root (`ubi_churn/`) and run `claude`.
+3. Ask in plain words, for example:
+   - "How is `sessions_per_week` computed?"
+   - "Why does the model rely so much on `days_since_last_match`?"
+   - "Which notebook shows that skill does not explain churn?"
+   - "What do I change to use a 60-minute session gap, and what must I re-run?"
+   - "Walk me through what happens when I click Predict and save in notebook 08."
+
+Keep `CLAUDE.md` up to date when the project changes (new feature, new notebook, new caveat).
